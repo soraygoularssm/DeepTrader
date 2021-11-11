@@ -1,0 +1,200 @@
+#include <Trade\Trade.mqh>
+#include <News.mqh>
+#define numRows 15
+#define slopePeriod 5
+
+CTrade Trade; 
+CNews news;
+
+input int iEpoch = 100;
+input double iLr = 0.01;
+
+double lots;
+double init_lot = 0.1;
+
+double weights[];
+double xVals[numRows][4];
+
+double i1[numRows+slopePeriod];
+int hI1;
+int hClose,hOpen;
+
+int handle_iATR;
+
+int OnInit() {
+   news.SaveHistory(true);
+   news.LoadHistory();
+   
+   hI1 = iRSI(_Symbol,PERIOD_M5,14,PRICE_CLOSE);
+   
+   handle_iATR = iATR(Symbol(),Period(),14);
+   
+   return INIT_SUCCEEDED;
+}
+
+void OnTick() {
+   int events_total=news.update();
+   
+   if(PositionSelectByTicket(PositionGetTicket(PositionsTotal() - 1)))
+      if(TotalProfit() > lots/PositionsTotal()){
+         Trade.PositionClose(_Symbol);
+         lots = init_lot;
+      }
+   
+   if(isNewBar() && PositionsTotal() < 10) {
+      PrepareInputs(xVals,2);
+      train_weights(weights,xVals,iLr,iEpoch);
+      
+      lots = lots + init_lot;
+      
+      PrepareInputs(xVals,0);
+      int prediction = predict(xVals,weights,numRows-1);
+      if(prediction == 1)
+         if(PositionSelectByTicket(PositionGetTicket(PositionsTotal() - 1))) {
+            if((ENUM_ORDER_TYPE)PositionGetInteger(POSITION_TYPE)==ORDER_TYPE_BUY)
+               Trade.Buy(lots,_Symbol);
+         } else
+            Trade.Buy(lots,_Symbol);
+      else if(prediction == 0)
+         if(PositionSelectByTicket(PositionGetTicket(PositionsTotal() - 1))) {
+            if((ENUM_ORDER_TYPE)PositionGetInteger(POSITION_TYPE)==ORDER_TYPE_SELL)
+               Trade.Sell(lots,_Symbol);
+         } else
+            Trade.Sell(lots,_Symbol);
+   }
+}
+
+void PrepareInputs(double &xVals[][4],int shift) {
+   CopyBuffer(hI1,0,shift,numRows*2,i1);
+   
+   for(int i = 0; i < numRows; i++) {
+      for(int j = 0; j < 4; j++) {
+         if(j == 0)
+            xVals[i][j] = (iClose(_Symbol,PERIOD_CURRENT,shift+slopePeriod+i)-iClose(_Symbol,PERIOD_CURRENT,shift+i))/slopePeriod;
+         else if(j == 1)
+            xVals[i][j] = (iVolume(_Symbol,PERIOD_CURRENT,shift+slopePeriod+i)-iVolume(_Symbol,PERIOD_CURRENT,shift+i))/slopePeriod;
+         else if(j == 2)
+            xVals[i][j] = (i1[i+slopePeriod] - i1[i])/slopePeriod;
+         else if(j == 3)
+            xVals[i][j] = (iATRGet(slopePeriod+shift+i) - iATRGet(shift+i))/slopePeriod;
+      }
+   }
+}
+
+void train_weights(double &weights[], double &X[][4], double l_rate=0.01, int n_epoch=10)
+  {
+   ArrayResize(weights, ArrayRange(X, 1));
+   ArrayInitialize(weights, 0);
+     
+   for(int epoch=0; epoch<n_epoch; epoch++)
+     {
+      double sum_error = 0.0;
+      for(int row=0; row<ArrayRange(X, 0); row++)
+        {
+         double y = predict(X, weights, row);
+         
+         double price_diffrence = iClose(_Symbol,PERIOD_CURRENT,ArrayRange(X, 0)-row+1) - iClose(_Symbol,PERIOD_CURRENT,ArrayRange(X, 0)-row);
+         int dir;
+         if(price_diffrence>0)
+            dir = 1;
+         else
+            dir = 0;
+         
+         double error = dir - y;
+         sum_error += pow(error, 2);
+         weights[0] = weights[0] + l_rate * error;
+
+         for(int i=0; i<ArrayRange(X, 1)-1; i++)
+           {
+            weights[i+1] = weights[i+1] + l_rate * error * X[row][i];
+           }
+        }
+     }
+  }
+  
+double predict(double &X[][4], double &weights[], const int row=0)
+  {
+   double z = weights[0];
+   for(int i=0; i<ArrayRange(X, 1)-1; i++)
+     {
+      z+=weights[i+1]*X[row][i];
+     }
+   return activation(z);
+  }
+  
+double activation(const double net) //#
+  {
+   double Out;
+   Out=1/(1+exp(-net));
+   if(Out > 0.5)
+      Out = 1;
+   else if (Out < 0.5)
+      Out = 0;
+   return(Out);
+  }
+  
+
+bool isNewBar()
+{
+//--- memorize the time of opening of the last bar in the static variable
+   static datetime last_time=0;
+//--- current time
+   datetime lastbar_time=SeriesInfoInteger(Symbol(),Period(),SERIES_LASTBAR_DATE);
+
+//--- if it is the first call of the function
+   if(last_time==0)
+     {
+      //--- set the time and exit
+      last_time=lastbar_time;
+      return(false);
+     }
+
+//--- if the time differs
+   if(last_time!=lastbar_time)
+     {
+      //--- memorize the time and return true
+      last_time=lastbar_time;
+      return(true);
+     }
+//--- if we passed to this line, then the bar is not new; return false
+   return(false);
+}
+
+double iATRGet(const int index)
+  {
+   double ATR[1];
+//--- reset error code
+   ResetLastError();
+//--- fill a part of the iRSI array with values from the indicator buffer that has 0 index
+   if(CopyBuffer(handle_iATR,0,index,1,ATR)<0)
+     {
+      //--- if the copying fails, tell the error code
+      PrintFormat("Failed to copy data from the iRSI indicator, error code %d",GetLastError());
+      //--- quit with zero result - it means that the indicator is considered as not calculated
+      return(0.0);
+     }
+   return(ATR[0]);
+  }
+  
+double TotalProfit()
+{
+   double profit = 0.0;
+
+   for(int pos = PositionsTotal()-1; pos >= 0; pos--)
+        if (PositionSelectByTicket(PositionGetTicket(pos)))
+            profit +=  PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+            
+   return( profit );
+}
+
+
+void printlog_show_event(int index)
+  {
+   Print("event ",index,": ",news.eventname[index],", ",TimeToString(news.event[index].time));
+   if (news.event[index].unit!=CALENDAR_UNIT_NONE)
+     {
+      Print("--- actual: ",DoubleToString(news.event[index].actual_value,2),
+            ", previous: ",DoubleToString(news.event[index].prev_value,2),
+            ", forecast: ",DoubleToString(news.event[index].forecast_value,2));
+     }
+  }
